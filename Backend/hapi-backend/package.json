@@ -1,0 +1,13 @@
+{
+  "name": "hapi-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@hapi/hapi": "^21.3.2",
+    "sqlite3": "^5.1.6"
+  }
+}
