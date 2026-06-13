@@ -38,6 +38,20 @@ POST
 }
 ```
 
+Kamu juga bisa memilih model yang digunakan dengan menambahkan field `model`:
+
+```json
+{
+  "text": "aku capek banget hari ini bener-bener stres karena kerjaan numpuk",
+  "model": "binary"
+}
+```
+
+Nilai `model` yang valid:
+- `binary` (model klasifikasi biner)
+- `multiclass` (model klasifikasi multi-kelas)
+- `both` (jika ingin menjalankan kedua model dan melihat detail kedua hasilnya)
+
 ---
 
 ## Response

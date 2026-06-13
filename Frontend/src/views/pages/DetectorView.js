@@ -5,6 +5,7 @@ export class DetectorView {
         this.pageId = 'detector';
         this.isActive = false;
         this.selectedFile = null;
+        this.selectedModel = 'binary';
         this.eventListenersAdded = false;
         this.config = {
             MAX_FILE_SIZE: 5 * 1024 * 1024,
@@ -39,6 +40,13 @@ export class DetectorView {
                     <div class="preview-section" id="previewSection" style="display: none;">
                         <img id="previewImage" class="preview-image" alt="Preview" />
                         <div class="file-info" id="fileInfo"></div>
+                        <div class="model-selection" id="modelSelection">
+                            <label for="modelSelect"><strong>Pilih Jenis Klasifikasi</strong></label>
+                            <select id="modelSelect">
+                                <option value="binary">Klasifikasi Biner</option>
+                                <option value="multiclass">Klasifikasi Multiclass</option>
+                            </select>
+                        </div>
                         <button class="analyze-btn" id="analyzeBtn">
                             🔍 Analisis Tingkat Stress
                         </button>
@@ -59,10 +67,17 @@ export class DetectorView {
                             <p id="stressPercentage">-</p>
                         </div>
                         
+                        <div class="ocr-section">
+                            <h4>📝 Teks yang Diekstrak (OCR)</h4>
+                            <div id="extractedOCRText" class="extracted-text-box"></div>
+                        </div>
+                        
                         <div class="stress-details">
                             <h4>📊 Detail Analisis</h4>
                             <div id="analysisDetails">
-                                <p><strong>Kata-kata indikator stress:</strong> <span id="stressWords">-</span></p>
+                                <p><strong>Model yang digunakan:</strong> <span id="modelUsed">Binary</span></p>
+                                <p><strong>Kata/frasa indikator stress dari chat:</strong></p>
+                                <div id="stressWords" class="stress-words">-</div>
                                 <p><strong>Sentimen dominan:</strong> <span id="sentiment">-</span></p>
                                 <p><strong>Rekomendasi:</strong> <span id="recommendation">-</span></p>
                             </div>
@@ -106,6 +121,13 @@ export class DetectorView {
             fileInput.addEventListener('change', this.handleFileChange);
         }
 
+        const modelSelect = document.getElementById('modelSelect');
+        if (modelSelect) {
+            modelSelect.removeEventListener('change', this.handleModelChange);
+            this.handleModelChange = this.handleModelChange.bind(this);
+            modelSelect.addEventListener('change', this.handleModelChange);
+        }
+
         if (analyzeBtn) {
             analyzeBtn.removeEventListener('click', this.handleAnalyzeClick);
             this.handleAnalyzeClick = this.handleAnalyzeClick.bind(this);
@@ -132,6 +154,11 @@ export class DetectorView {
         if (e.target.files.length > 0) {
             this.handleFileSelect(e.target.files[0]);
         }
+    }
+
+    handleModelChange(e) {
+        this.selectedModel = e.target.value;
+        console.log('Selected model:', this.selectedModel);
     }
 
     handleAnalyzeClick() {
@@ -323,13 +350,12 @@ export class DetectorView {
 
 async sendToAPI(text) {
     try {
-        console.log('Sending request to:', this.config.API_URL);
+        console.log('Sending request to:', this.config.API_URL, 'model:', this.selectedModel);
         const response = await fetch(this.config.API_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: text.substring(0, 1000) })
+            body: JSON.stringify({ text: text.substring(0, 1000), model: this.selectedModel })
         });
-
         console.log('Response status:', response.status, response.statusText);
 
         if (!response.ok) {
@@ -337,7 +363,7 @@ async sendToAPI(text) {
             try {
                 const errorData = await response.json();
                 errorMessage = errorData.message || errorData.error || errorMessage;
-                
+
                 // Handle specific error cases
                 if (response.status === 404) {
                     errorMessage = 'Server backend tidak ditemukan. Pastikan backend server aktif atau periksa konfigurasi URL.';
@@ -375,13 +401,20 @@ async sendToAPI(text) {
 
         formatApiResult(apiResult, originalText) {
         const stressLevel = Math.min(100, Math.max(0, apiResult.stress_percent || 0));
-        const isStressed = apiResult.prediction === "Negative";
+        const rawPrediction = (apiResult.prediction || '').toString().trim();
+        const modelType = apiResult.model_type || this.selectedModel || 'binary';
+        const category = modelType === 'multiclass'
+            ? (rawPrediction || this.getStressCategory(stressLevel))
+            : this.getStressCategory(stressLevel);
+        const sentiment = this.mapApiSentiment(rawPrediction, modelType);
 
         // Gunakan teks asli (sebelum cleaning) untuk ekstraksi kata stress
         const textForKeywordExtraction = this.originalExtractedText || originalText;
-        console.log('Extracting keywords from text (first 200 chars):', textForKeywordExtraction?.substring(0, 200));
+        const displayText = originalText;
+        console.log('Extracting keyword phrases from text (first 200 chars):', textForKeywordExtraction?.substring(0, 200));
 
-        // Extract stress keywords - lexicon lebih lengkap
+        const stressIndicators = this.extractStressIndicators(textForKeywordExtraction);
+
         const stressKeywords = [
             'stress', 'stres', 'tertekan', 'frustasi', 'panik', 
             'cemas', 'khawatir', 'gelisah', 'sedih', 'kecewa',
@@ -441,12 +474,35 @@ async sendToAPI(text) {
 
         return {
             stress_level: stressLevel,
-            category: this.getStressCategory(stressLevel),
-            stress_words: finalStressWords, // Use limited array
-            sentiment: isStressed ? 'Negatif' : 'Positif/Netral',
+            category: category,
+            model_type: modelType,
+            prediction: rawPrediction,
+            stress_words: stressIndicators.length > 0 ? stressIndicators : finalStressWords,
+            sentiment: sentiment,
             recommendation: recommendation,
-            original_text: originalText
+            original_text: originalText,
+            extracted_text: displayText
         };
+    }
+
+    normalizeApiCategory(prediction, modelType) {
+        if (modelType === 'binary') {
+            return prediction;
+        }
+        if (modelType === 'multiclass') {
+            return prediction;
+        }
+        return prediction || this.getStressCategory(Math.min(100, Math.max(0, prediction || 0)));
+    }
+
+    mapApiSentiment(prediction, modelType) {
+        if (modelType === 'binary') {
+            return prediction === 'Negative' ? 'Negatif' : 'Positif/Netral';
+        }
+        if (modelType === 'multiclass') {
+            return prediction.toLowerCase().includes('positif') ? 'Positif' : 'Negatif';
+        }
+        return prediction === 'Negative' ? 'Negatif' : 'Positif/Netral';
     }
 
     getStressCategory(percentage) {
@@ -530,28 +586,140 @@ async sendToAPI(text) {
         const wordsEl = document.getElementById('stressWords');
         const sentimentEl = document.getElementById('sentiment');
         const recommendationEl = document.getElementById('recommendation');
+        const ocrEl = document.getElementById('extractedOCRText');
+
+        const rawLabel = result.class_label || result.prediction || 'Tidak Diketahui';
+        const sentimentLabel = this.normalizeBinaryLabel(rawLabel, result.model_type || this.selectedModel);
+        const confidenceValue = result.class_probability != null
+            ? `${Math.round(result.class_probability * 100)}%`
+            : result.confidence != null
+                ? `${result.confidence}%`
+                : `${stressLevel}%`;
+        const stressSeverity = this.getStressCategory(stressLevel);
+        const sentimentDisplay = result.sentiment || sentimentLabel;
 
         if (categoryEl) {
-            categoryEl.textContent = `Tingkat Stress: ${result.category || 'Tidak Diketahui'}`;
+            categoryEl.textContent = `Hasil Sentimen: ${sentimentLabel}`;
+        }
+
+        if (percentageEl) {
+            percentageEl.textContent = `Confidence: ${confidenceValue} • ${stressSeverity}`;
         }
         
-        if (percentageEl) {
-            percentageEl.textContent = `${stressLevel}% dari tingkat stress maksimal`;
+        if (ocrEl) {
+            const rawOcr = this.originalExtractedText || result.extracted_text || '';
+            ocrEl.innerHTML = rawOcr.trim().length > 0
+                ? this.renderOcrChatBubbles(rawOcr)
+                : '<p>Teks tidak tersedia</p>';
         }
         
         if (wordsEl) {
-            wordsEl.textContent = result.stress_words && result.stress_words.length > 0 
-                ? result.stress_words.join(', ') 
+            wordsEl.innerHTML = result.stress_words && result.stress_words.length > 0 
+                ? `<ul class="stress-word-list">${result.stress_words.map(item => `<li>${this.escapeHtml(item)}</li>`).join('')}</ul>`
                 : 'Tidak terdeteksi';
         }
         
         if (sentimentEl) {
-            sentimentEl.textContent = result.sentiment || 'Netral';
+            sentimentEl.textContent = sentimentDisplay;
         }
         
         if (recommendationEl) {
             recommendationEl.textContent = result.recommendation || 'Tidak ada rekomendasi khusus';
         }
+
+        const modelUsedEl = document.getElementById('modelUsed');
+        if (modelUsedEl) {
+            modelUsedEl.textContent = this.selectedModel === 'binary' ? 'Binary' : 'Multiclass';
+        }
+    }
+
+    renderOcrChatBubbles(rawText) {
+        const lines = rawText
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(line => line.length > 0);
+
+        if (lines.length === 0) {
+            return '<p>Teks tidak tersedia</p>';
+        }
+
+        return lines.map((line, index) => {
+            const side = this.detectBubbleSide(line, index);
+            return `<div class="chat-bubble ${side}">${this.escapeHtml(line)}</div>`;
+        }).join('');
+    }
+
+    detectBubbleSide(line, index) {
+        const lower = line.toLowerCase();
+        const userMarkers = ['aku', 'saya', 'gue', 'gw', 'kamu', 'kmu', 'lu', 'lo', 'bro', 'sis', 'akun'];
+        if (userMarkers.some(word => lower.startsWith(word + ' ') || lower.includes(' ' + word + ' '))) {
+            return index % 2 === 0 ? 'right' : 'left';
+        }
+        return index % 2 === 0 ? 'left' : 'right';
+    }
+
+    escapeHtml(text) {
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    extractStressIndicators(rawText) {
+        if (!rawText || typeof rawText !== 'string') {
+            return [];
+        }
+
+        const stressKeywords = [
+            'stress', 'stres', 'tertekan', 'frustasi', 'panik',
+            'cemas', 'khawatir', 'gelisah', 'sedih', 'kecewa',
+            'capek', 'lelah', 'penat', 'pusing', 'deadline',
+            'tumpuk', 'numpuk', 'beban', 'kerja', 'kerjaan',
+            'masalah', 'sulit', 'susah', 'repot', 'ribet',
+            'buntu', 'gabut', 'bete', 'drama', 'risih',
+            'jengkel', 'kesal', 'bosan', 'males', 'malas',
+            'ga', 'gak', 'engga', 'enggak', 'udah', 'gatau',
+            'susah', 'nggak', 'stress banget', 'sangat stress'
+        ];
+
+        const lines = rawText
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(line => line.length > 0);
+
+        const foundPhrases = [];
+        for (const line of lines) {
+            const lowerLine = line.toLowerCase();
+            for (const keyword of stressKeywords) {
+                if (lowerLine.includes(keyword)) {
+                    if (!foundPhrases.includes(line)) {
+                        foundPhrases.push(line);
+                    }
+                    break;
+                }
+            }
+            if (foundPhrases.length >= 5) {
+                break;
+            }
+        }
+
+        return foundPhrases;
+    }
+
+    normalizeBinaryLabel(label, modelType) {
+        const normalized = (label || '').toString().trim();
+        if (modelType === 'binary' || this.selectedModel === 'binary') {
+            const lower = normalized.toLowerCase();
+            if (lower.includes('negative') || lower.includes('stres') || lower === 'negative') {
+                return 'Stres';
+            }
+            if (lower.includes('positive') || lower.includes('tidak stres') || lower === 'positive') {
+                return 'Tidak Stres';
+            }
+        }
+        return normalized || 'Tidak Diketahui';
     }
 
     showLoading(show) {

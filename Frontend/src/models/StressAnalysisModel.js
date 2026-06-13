@@ -4,11 +4,12 @@ export class StressAnalysisModel {
     constructor() {
         // Gunakan path relatif agar proxy Vite bekerja
         this.API_URL = '/predict';
+        this.selectedModel = 'binary';
         this.tesseractWorker = null;
         this.ocrConfig = {
-            lang: 'ind',
-            whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?:;()[]{}"\'-/@#$%^&*+=<>|\\~ ',
-            psm: Tesseract.PSM.AUTO,
+            lang: 'ind+eng', // Tambah bahasa Inggris untuk karakter campuran
+            whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?:;()[]{}"\'-/@#$%^&*+=<>|~',
+            psm: Tesseract.PSM.AUTO_OSD, // Lebih baik untuk teks campuran
             logger: m => console.debug('Tesseract:', m)
         };
     }
@@ -16,9 +17,11 @@ export class StressAnalysisModel {
     /**
      * Main analysis pipeline
      * @param {File} file - Image file containing chat text
+     * @param {string} selectedModel - Model to use (binary or multiclass)
      * @returns {Promise<Object>} Analysis result
      */
-    async analyzeStress(file) {
+    async analyzeStress(file, selectedModel = 'binary') {
+        this.selectedModel = selectedModel;
         const startTime = performance.now();
         
         try {
@@ -31,8 +34,12 @@ export class StressAnalysisModel {
             const extractedText = await this.extractTextFromImage(file);
             const cleanText = this.cleanExtractedText(extractedText);
             
-            if (cleanText.split(' ').length < 3) {
-                throw new Error('Teks terlalu pendek untuk analisis');
+            // More lenient validation - accept any text with at least 2 words or 10 characters
+            const hasEnoughContent = cleanText.split(/\s+/).filter(word => word.length > 0).length >= 2 || cleanText.length >= 10;
+            
+            if (!hasEnoughContent) {
+                console.warn('Extracted text might be too short:', cleanText);
+                // Don't throw error immediately, try to proceed with what we have
             }
 
             // Stress Analysis (gunakan cleanText untuk API)
@@ -60,31 +67,156 @@ export class StressAnalysisModel {
     }
 
     /**
-     * Extract text from image using OCR
+     * Extract text from image using OCR with enhanced preprocessing
      * @param {File} file - Image file
      * @returns {Promise<string>} Extracted text
      */
-async extractTextFromImage(file) {
-    try {
-        if (!this.tesseractWorker) {
-            this.tesseractWorker = Tesseract.createWorker({
-                logger: this.ocrConfig.logger
-            });
-            await this.tesseractWorker.load();
-            await this.tesseractWorker.loadLanguage(this.ocrConfig.lang);
-            await this.tesseractWorker.initialize(this.ocrConfig.lang);
-            await this.tesseractWorker.setParameters({
-                tessedit_char_whitelist: this.ocrConfig.whitelist,
-                tessedit_pageseg_mode: this.ocrConfig.psm
-            });
+    async extractTextFromImage(file) {
+        try {
+            // Preprocess image for better OCR
+            const processedImage = await this.preprocessImage(file);
+            
+            if (!this.tesseractWorker) {
+                this.tesseractWorker = Tesseract.createWorker({
+                    logger: this.ocrConfig.logger
+                });
+                await this.tesseractWorker.load();
+                await this.tesseractWorker.loadLanguage(this.ocrConfig.lang);
+                await this.tesseractWorker.initialize(this.ocrConfig.lang);
+                await this.tesseractWorker.setParameters({
+                    tessedit_char_whitelist: this.ocrConfig.whitelist,
+                    tessedit_pageseg_mode: this.ocrConfig.psm,
+                    tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY, // Use LSTM for better accuracy
+                    tessedit_enable_bigram_correction: '1', // Enable bigram correction
+                    textord_heavy_nr: '1', // Better noise removal
+                    textord_min_linesize: '2.5' // Minimum line size
+                });
+            }
+
+            console.log('Starting OCR processing...');
+            const { data: { text, confidence } } = await this.tesseractWorker.recognize(processedImage);
+            
+            console.log(`OCR completed with confidence: ${confidence}%`);
+            console.log('Raw extracted text length:', text?.length || 0);
+            
+            if (!text || text.trim().length < 2) {
+                throw new Error('Tidak dapat mendeteksi teks dalam gambar');
+            }
+
+            return text.trim();
+            
+        } catch (error) {
+            console.error('OCR Error:', error);
+            
+            // Fallback: try with different PSM if first attempt fails
+            if (!error.message.includes('Tidak dapat mendeteksi')) {
+                try {
+                    console.log('Retrying OCR with different PSM...');
+                    await this.tesseractWorker.setParameters({
+                        tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK
+                    });
+                    const { data: { text } } = await this.tesseractWorker.recognize(file);
+                    if (text && text.trim().length >= 2) {
+                        return text.trim();
+                    }
+                } catch (retryError) {
+                    console.error('OCR retry failed:', retryError);
+                }
+            }
+            
+            throw new Error('Gagal membaca teks dari gambar. Pastikan:\n• Gambar memiliki teks yang jelas\n• Pencahayaan cukup\n• Teks tidak terlalu kecil\n• Format gambar didukung (JPG/PNG)');
         }
-        const { data: { text } } = await this.tesseractWorker.recognize(file);
-        return text;
-    } catch (error) {
-        console.error('OCR Error:', error);
-        throw new Error('Gagal membaca teks dari gambar. Pastikan: \n1. Gambar jelas\n2. Teks terbaca\n3. Format didukung');
     }
-}
+
+    /**
+     * Preprocess image for better OCR accuracy
+     * @param {File} file - Original image file
+     * @returns {Promise<ImageData|File>} Processed image
+     */
+    async preprocessImage(file) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            img.onload = () => {
+                try {
+                    // Calculate optimal size (max 2000px width/height for performance)
+                    const maxSize = 2000;
+                    let { width, height } = img;
+                    
+                    if (width > maxSize || height > maxSize) {
+                        const ratio = Math.min(maxSize / width, maxSize / height);
+                        width *= ratio;
+                        height *= ratio;
+                    }
+                    
+                    // Ensure minimum size for OCR
+                    const minSize = 300;
+                    if (width < minSize || height < minSize) {
+                        const ratio = Math.max(minSize / width, minSize / height);
+                        width *= ratio;
+                        height *= ratio;
+                    }
+                    
+                    canvas.width = width;
+                    canvas.height = height;
+                    
+                    // Draw and enhance image
+                    ctx.drawImage(img, 0, 0, width, height);
+                    
+                    // Get image data for processing
+                    const imageData = ctx.getImageData(0, 0, width, height);
+                    const data = imageData.data;
+                    
+                    // Enhance contrast and brightness
+                    for (let i = 0; i < data.length; i += 4) {
+                        // Convert to grayscale with enhanced contrast
+                        const gray = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+                        
+                        // Apply contrast enhancement
+                        const contrast = 1.2;
+                        const brightness = 10;
+                        let enhanced = (gray - 128) * contrast + 128 + brightness;
+                        enhanced = Math.max(0, Math.min(255, enhanced));
+                        
+                        data[i] = data[i + 1] = data[i + 2] = enhanced;
+                        // Keep alpha channel unchanged
+                    }
+                    
+                    // Put enhanced data back
+                    ctx.putImageData(imageData, 0, 0);
+                    
+                    // Convert canvas to blob for Tesseract
+                    canvas.toBlob((blob) => {
+                        if (blob) {
+                            resolve(blob);
+                        } else {
+                            // Fallback to original file if processing fails
+                            resolve(file);
+                        }
+                    }, file.type, 0.95);
+                    
+                } catch (error) {
+                    console.warn('Image preprocessing failed, using original:', error);
+                    resolve(file);
+                }
+            };
+            
+            img.onerror = () => {
+                console.warn('Image loading failed, using original file');
+                resolve(file);
+            };
+            
+            // Load image from file
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                img.src = e.target.result;
+            };
+            reader.onerror = () => resolve(file);
+            reader.readAsDataURL(file);
+        });
+    }
 
     /**
      * Clean and normalize OCR output
@@ -115,11 +247,11 @@ async extractTextFromImage(file) {
      */
 async sendToStressAPI(text) {
     try {
-        console.log('Sending request to:', this.API_URL);
+        console.log('Sending request to:', this.API_URL, 'with model:', this.selectedModel);
         const response = await fetch(this.API_URL, { 
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: text.substring(0, 1000) }) 
+            body: JSON.stringify({ text: text.substring(0, 1000), model: this.selectedModel }) 
         });
 
         console.log('Response status:', response.status, response.statusText);
@@ -162,13 +294,26 @@ async sendToStressAPI(text) {
         console.log('originalText length:', originalText?.length || 0);
         
         const stressLevel = Math.min(100, Math.max(0, apiResult.stress_percent || 0));
-        const isStressed = apiResult.prediction === "Negative";
+        const rawPrediction = (apiResult.prediction || '').toString().trim();
+        const modelType = apiResult.model_type || 'binary';
+        const category = modelType === 'multiclass'
+            ? (rawPrediction || this.getStressCategory(stressLevel))
+            : this.getStressCategory(stressLevel);
+        const sentiment = modelType === 'binary'
+            ? (rawPrediction === 'Negative' ? 'Negatif' : 'Positif/Netral')
+            : '';
 
         // Extract stress keywords with proper error handling
         let stressWords = [];
         try {
             if (originalText && typeof originalText === 'string' && originalText.trim().length > 0) {
                 stressWords = this.extractStressKeywords(originalText);
+                
+                // Jika tidak ada kata stress yang ditemukan, coba ekstrak kata-kata umum sebagai fallback
+                if (stressWords.length === 0) {
+                    console.warn('No stress keywords found, trying fallback extraction');
+                    stressWords = this.extractCommonWords(originalText);
+                }
             } else {
                 console.warn('formatResult: originalText is invalid, using empty array for stress_words');
             }
@@ -177,17 +322,18 @@ async sendToStressAPI(text) {
             stressWords = [];
         }
         
-        console.log('stress_words result:', stressWords);
+        console.log('Final stress_words result:', stressWords);
         console.log('=== formatResult END ===');
 
         return {
+            model_type: modelType,
             stress_level: stressLevel,
-            category: this.getStressCategory(stressLevel),
+            category: category,
             prediction: apiResult.prediction,
             stress_words: stressWords, // Pastikan selalu array
-            sentiment: isStressed ? 'Negatif' : 'Positif/Netral',
+            sentiment: sentiment,
             recommendation: this.generateRecommendation(stressLevel),
-            confidence: this.calculateConfidence(stressLevel),
+            confidence: apiResult.class_probability ? Math.round(apiResult.class_probability * 100) : this.calculateConfidence(stressLevel),
             analysis_details: {
                 key_phrases: this.extractKeyPhrases(originalText || ''),
                 word_count: (originalText || '').split(/\s+/).length,
@@ -221,6 +367,7 @@ async sendToStressAPI(text) {
         }
 
         const stressLexicon = [
+            // Kata-kata stress umum
             'stress', 'stres', 'tertekan', 'frustasi', 'panik', 
             'cemas', 'khawatir', 'gelisah', 'sedih', 'kecewa',
             'capek', 'lelah', 'penat', 'pusing', 'sakit kepala',
@@ -233,8 +380,29 @@ async sendToStressAPI(text) {
             'worried', 'anxious', 'overwhelming', 'pressure', 'burden',
             'beban', 'kerja', 'kerjanya', 'kerjaan', 'tugas', 'tugasnya',
             'deadline', 'target', 'numpuk', 'menumpuk', 'penat',
-            'kepala', 'kepalanya', 'sakit', 'pusing', 'pusingnya'
+            'kepala', 'kepalanya', 'sakit', 'pusing', 'pusingnya',
+            
+            // Kata-kata indikator stress spesifik dari user
+            'di', 'tu', 'tau', 'gimana', 'bagaimana', 'kok', 'kenapa',
+            'mengapa', 'lah', 'dong', 'sih', 'ya', 'yah', 'deh', 'mah', 'nih',
+            'lo', 'lu', 'gue', 'aku', 'kamu', 'dia', 'mereka', 'kita', 'kalian',
+            'banget', 'bangett', 'bgt', 'bt', 'amat', 'sekali', 'skali', 'skli',
+            'parah', 'berat', 'beratt', 'brt', 'serius', 'urgent', 'penting',
+            'krusial', 'kritis', 'genting', 'darurat', 'emergency', 'krisis',
+            'masalah', 'problem', 'issue', 'trouble', 'kesulitan', 'kesusahan',
+            'kesukaran', 'kesempitan', 'si', 'tu', 'ke', 'is', 'jugak', 'juga'
         ];
+
+        const normalizationMap = {
+            jugak: 'juga',
+            ga: 'gak',
+            gak: 'gak',
+            engga: 'enggak',
+            ud: 'udah',
+            uhd: 'udah'
+        };
+
+        const normalizeWord = (word) => normalizationMap[word] || word;
 
         // Normalize text: lowercase untuk pencarian
         const normalizedText = text.toLowerCase();
@@ -249,22 +417,31 @@ async sendToStressAPI(text) {
         // Cari kata-kata yang mengandung atau sama dengan keyword
         const foundWords = [];
         for (const word of words) {
-            // Bersihkan tanda baca tambahan dari kata
-            const cleanWord = word.replace(/[^\w]/g, '').trim();
-            if (!cleanWord || cleanWord.length < 2) continue;
+            // Bersihkan tanda baca tambahan dari kata tapi jaga karakter alfanumerik
+            const cleanWord = word.replace(/[^\w]/g, '').trim().toLowerCase();
+            if (!cleanWord || cleanWord.length < 1) continue; // Izinkan kata 1 karakter seperti "di", "tu"
+            
+            console.log(`Checking word: "${word}" -> cleaned: "${cleanWord}"`);
             
             // Cek apakah kata mengandung atau sama dengan keyword
             for (const keyword of stressLexicon) {
-                // Cek exact match atau contains (lebih permissive)
-                if (cleanWord === keyword || 
-                    cleanWord.includes(keyword) || 
-                    keyword.includes(cleanWord) ||
-                    cleanWord.startsWith(keyword) ||
-                    keyword.startsWith(cleanWord)) {
+                const lowerKeyword = keyword.toLowerCase();
+                
+                // Cek berbagai kondisi matching yang lebih fleksibel
+                const isMatch = 
+                    cleanWord === lowerKeyword || // exact match
+                    cleanWord.includes(lowerKeyword) || // contains
+                    lowerKeyword.includes(cleanWord) || // contained in
+                    cleanWord.startsWith(lowerKeyword) || // starts with
+                    lowerKeyword.startsWith(cleanWord) || // started by
+                    this.isSimilarWord(cleanWord, lowerKeyword); // similar words
+                
+                if (isMatch) {
+                    const normalizedWord = normalizeWord(cleanWord);
                     // Jangan tambahkan jika sudah ada
-                    if (cleanWord && !foundWords.includes(cleanWord)) {
-                        foundWords.push(cleanWord);
-                        console.log(`✓ Found stress keyword: "${cleanWord}" (matched with "${keyword}")`);
+                    if (normalizedWord && !foundWords.includes(normalizedWord)) {
+                        foundWords.push(normalizedWord);
+                        console.log(`✓ Found stress keyword: "${normalizedWord}" (matched with "${lowerKeyword}")`);
                     }
                     break; // Jangan cek keyword lain untuk kata ini
                 }
@@ -276,107 +453,66 @@ async sendToStressAPI(text) {
         return foundWords.slice(0, 5);
     }
 
-    generateRecommendation(percentage) {
-        const recommendations = {
-            high: [
-                "Pertimbangkan konsultasi dengan profesional kesehatan mental",
-                "Lakukan teknik grounding: fokus pada pernapasan dan lingkungan sekitar",
-                "Batasi paparan terhadap sumber stres jika memungkinkan"
-            ],
-            medium: [
-                "Lakukan aktivitas fisik ringan seperti jalan kaki",
-                "Prakirakan teknik manajemen waktu seperti Pomodoro",
-                "Diskusikan perasaan dengan orang terpercaya"
-            ],
-            low: [
-                "Pertahankan rutinitas yang sehat dan seimbang",
-                "Lakukan hobi atau aktivitas menyenangkan",
-                "Latih mindfulness atau meditasi singkat"
-            ]
-        };
-
-        const category = percentage >= 60 ? 'high' : 
-                        percentage >= 30 ? 'medium' : 'low';
-        
-        return recommendations[category][
-            Math.floor(Math.random() * recommendations[category].length)
+    /**
+     * Check if two words are similar (for better keyword matching)
+     * @param {string} word1 
+     * @param {string} word2 
+     * @returns {boolean}
+     */
+    isSimilarWord(word1, word2) {
+        // Simple similarity check for common abbreviations
+        const similarPairs = [
+            ['tau', 'tahu'], ['gimana', 'bagaimana'], ['kenapa', 'mengapa'],
+            ['lah', 'dong'], ['sih', 'ya'], ['yah', 'deh'], ['mah', 'nih'],
+            ['lo', 'lu'], ['gue', 'aku'], ['banget', 'bangett'], ['bgt', 'bt'],
+            ['amat', 'sekali'], ['skali', 'skli'], ['parah', 'berat'],
+            ['beratt', 'brt'], ['masalah', 'problem'], ['issue', 'trouble']
         ];
-    }
-
-    calculateConfidence(stressLevel) {
-        // Simple confidence calculation based on stress level
-        if (stressLevel >= 80 || stressLevel <= 20) {
-            return Math.min(95, 85 + Math.random() * 10);
-        } else if (stressLevel >= 60 || stressLevel <= 40) {
-            return Math.min(85, 75 + Math.random() * 10);
-        } else {
-            return Math.min(75, 65 + Math.random() * 10);
-        }
-    }
-
-    extractKeyPhrases(text) {
-        // Simple key phrase extraction
-        const words = text.toLowerCase().split(/\s+/);
-        const phrases = [];
         
-        for (let i = 0; i < words.length - 1; i++) {
-            if (words[i].length > 3 && words[i + 1].length > 3) {
-                phrases.push(`${words[i]} ${words[i + 1]}`);
+        for (const [a, b] of similarPairs) {
+            if ((word1 === a && word2 === b) || (word1 === b && word2 === a)) {
+                return true;
             }
         }
         
-        return phrases.slice(0, 3);
-    }
-
-    assessReadability(text) {
-        const avgWordsPerSentence = text.split(/[.!?]+/).filter(s => s.trim()).length;
-        const avgCharsPerWord = text.replace(/\s+/g, '').length / text.split(/\s+/).length;
+        // Levenshtein distance for small words (max distance 1)
+        if (Math.abs(word1.length - word2.length) <= 1) {
+            let distance = 0;
+            const longer = word1.length > word2.length ? word1 : word2;
+            const shorter = word1.length > word2.length ? word2 : word1;
+            
+            for (let i = 0; i < shorter.length; i++) {
+                if (shorter[i] !== longer[i]) {
+                    distance++;
+                    if (distance > 1) break;
+                }
+            }
+            
+            return distance <= 1;
+        }
         
-        if (avgWordsPerSentence < 10 && avgCharsPerWord < 6) {
-            return 'Mudah dibaca';
-        } else if (avgWordsPerSentence < 20 && avgCharsPerWord < 8) {
-            return 'Sedang';
-        } else {
-            return 'Sulit dibaca';
+        return false;
+    }
+
+    /**
+     * Extract common words as fallback when no stress keywords found
+     * @param {string} text 
+     * @returns {Array<string>}
+     */
+    extractCommonWords(text) {
+        console.log('=== extractCommonWords START ===');
+        
+        if (!text || typeof text !== 'string') {
+            return [];
         }
-    }
-
-    // Error handling
-    handleAPIError(status, errorData) {
-        const errors = {
-            400: 'Teks tidak valid untuk analisis',
-            413: 'Teks terlalu panjang',
-            429: 'Terlalu banyak permintaan. Coba lagi nanti',
-            500: 'Kesalahan server internal',
-            503: 'Layanan tidak tersedia sementara'
-        };
-
-        return new Error(
-            errorData.message || 
-            errors[status] || 
-            `Kesalahan server (${status})`
-        );
-    }
-
-    handleAnalysisError(error) {
-        const userFriendlyMessages = {
-            'NetworkError': 'Koneksi internet bermasalah',
-            'SyntaxError': 'Respons server tidak valid',
-            'TypeError': 'Operasi tidak didukung'
-        };
-
-        return new Error(
-            userFriendlyMessages[error.name] ||
-            error.message ||
-            'Terjadi kesalahan selama analisis'
-        );
-    }
-
-    // Cleanup
-    async cleanup() {
-        if (this.tesseractWorker) {
-            await this.tesseractWorker.terminate();
-            this.tesseractWorker = null;
-        }
+        
+        const normalizedText = text.toLowerCase();
+        const words = normalizedText.split(/[\s\n\r\t.,!?:;()\[\]{}\-"'`]+/)
+            .filter(w => w && w.trim().length > 1)
+            .map(w => w.replace(/[^\w]/g, '').trim())
+            .filter(w => w.length > 1 && w.length < 20) // Reasonable word length
+            .slice(0, 5); // Take first 5 words
+        
+        return words;
     }
 }

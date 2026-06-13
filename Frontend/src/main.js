@@ -39,12 +39,13 @@ class App {
             console.log('[App] Initializing controllers...');
             this.appController = new AppController();
             this.navigationController = new NavigationController();
-            this.detectorController = new DetectorController();
+            // DetectorController disabled - using DetectorView instead
+            // this.detectorController = new DetectorController();
             this.contactController = new ContactController();
             
             this.appController.init();
             this.navigationController.init();
-            this.detectorController.init();
+            // this.detectorController.init();
             this.contactController.init();
 
             console.log('[App] Controllers initialized successfully');
@@ -187,38 +188,21 @@ window.navigateToPageSmooth = (page, targetElement = null) => {
 // Global detector functions with smooth scrolling
 window.analyzeStress = () => {
     console.log('[Global] Analyze stress called');
-    if (app.detectorController && typeof app.detectorController.analyzeStress === 'function') {
-        app.detectorController.analyzeStress();
-        
-        // Smooth scroll to results section after analysis
-        setTimeout(() => {
-            const resultSection = document.querySelector('.result-section') || 
-                                 document.querySelector('.analysis-result') ||
-                                 document.getElementById('resultSection');
-            
-            if (resultSection) {
-                resultSection.scrollIntoView({ 
-                    behavior: 'smooth',
-                    block: 'start'
-                });
-            }
-        }, 500); // Delay to allow analysis to complete
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    if (analyzeBtn) {
+        analyzeBtn.click();
     } else {
-        console.error('[Global] Detector controller not available');
+        console.error('[Global] Analyze button not found');
     }
 };
 
 window.resetForm = () => {
     console.log('[Global] Reset form called');
-    if (app.detectorController && typeof app.detectorController.resetForm === 'function') {
-        app.detectorController.resetForm();
-        
-        // Smooth scroll to top after reset
-        setTimeout(() => {
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-        }, 100);
+    const resetBtn = document.getElementById('resetBtn');
+    if (resetBtn) {
+        resetBtn.click();
     } else {
-        console.error('[Global] Detector controller not available');
+        console.error('[Global] Reset button not found');
     }
 };
 

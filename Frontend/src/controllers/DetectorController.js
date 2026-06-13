@@ -5,6 +5,7 @@ import { FileUploadModel } from '../models/FileUploadModel.js';
 export class DetectorController {
     constructor() {
         this.selectedFile = null;
+        this.selectedModel = 'binary';
         this.stressModel = new StressAnalysisModel();
         this.fileUploadModel = new FileUploadModel();
         this.isAnalyzing = false;
@@ -63,6 +64,7 @@ export class DetectorController {
         this.previewSection = document.getElementById('previewSection');
         this.previewImage = document.getElementById('previewImage');
         this.fileInfo = document.getElementById('fileInfo');
+        this.modelSelect = document.getElementById('modelSelect');
         this.analyzeBtn = document.getElementById('analyzeBtn');
         this.loadingSection = document.getElementById('loadingSection');
         this.resultSection = document.getElementById('resultSection');
@@ -75,6 +77,23 @@ export class DetectorController {
         }
 
         this.cleanupEventListeners();
+
+        if (this.modelSelect) {
+            this.selectedModel = this.modelSelect.value || 'binary';
+            const handleModelChange = (e) => {
+                this.selectedModel = e.target.value;
+                console.log('Selected model:', this.selectedModel);
+            };
+            this.modelSelect.addEventListener('change', handleModelChange);
+            this.boundHandlers.modelchange = { element: this.modelSelect, event: 'change', callback: handleModelChange };
+        }
+
+        this.setupFileInput();
+        this.setupUploadButton();
+        this.setupAnalyzeButton();
+        this.setupResetButton();
+        this.setupDragAndDrop();
+        this.isInitialized = true;
     }
 
     // Check apakah DetectorView pattern sedang aktif
@@ -222,6 +241,10 @@ export class DetectorController {
             return;
         }
 
+        if (this.modelSelect) {
+            this.selectedModel = this.modelSelect.value || this.selectedModel;
+        }
+
         if (this.isAnalyzing) return;
 
         try {
@@ -230,7 +253,8 @@ export class DetectorController {
             this.setAnalyzeButtonState(false);
             this.hideResults();
 
-            const result = await this.stressModel.analyzeStress(this.selectedFile);
+            console.log('Analyzing with selected model:', this.selectedModel);
+            const result = await this.stressModel.analyzeStress(this.selectedFile, this.selectedModel);
             this.displayResults(result);
             
         } catch (error) {
@@ -280,12 +304,17 @@ export class DetectorController {
             recommendation: document.getElementById('recommendation')
         };
 
+        const isMulticlass = result.model_type === 'multiclass' || this.selectedModel === 'multiclass';
+
         if (elements.category) {
-            elements.category.textContent = `Tingkat Stress: ${result.category || 'Tidak Diketahui'}`;
+            const labelText = isMulticlass ? 'Kategori' : 'Hasil Sentimen';
+            elements.category.textContent = `${labelText}: ${result.category || 'Tidak Diketahui'}`;
         }
         
         if (elements.percentage) {
-            elements.percentage.textContent = `${stressLevel}% dari tingkat stress maksimal`;
+            elements.percentage.textContent = isMulticlass
+                ? `Confidence: ${result.confidence || stressLevel}%`
+                : `${stressLevel}% dari tingkat stress maksimal`;
         }
         
         if (elements.words) {
@@ -293,7 +322,13 @@ export class DetectorController {
         }
         
         if (elements.sentiment) {
-            elements.sentiment.textContent = result.sentiment || 'Netral';
+            const sentimentRow = elements.sentiment.closest('p');
+            if (result.model_type === 'multiclass') {
+                if (sentimentRow) sentimentRow.style.display = 'none';
+            } else {
+                if (sentimentRow) sentimentRow.style.display = '';
+                elements.sentiment.textContent = result.sentiment || 'Netral';
+            }
         }
         
         if (elements.recommendation) {

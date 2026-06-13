@@ -19,22 +19,62 @@ CORS(app, resources={
 }, supports_credentials=True)
 
 # Load model dan tokenizer dengan path absolut
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'model_lstm_stress.h5')
-TOKENIZER_PATH = os.path.join(os.path.dirname(__file__), 'model', 'tokenizer_stress.pkl')
+MODEL_CONFIG = {
+    'multiclass': {
+        'type': 'multiclass',
+        'model_path': os.path.join(os.path.dirname(__file__), 'model_multiclas', 'vanilla_multiclass_best.h5'),
+        'tokenizer_path': os.path.join(os.path.dirname(__file__), 'model_multiclas', 'tokenizer.pkl')
+    },
+    'binary': {
+        'type': 'binary',
+        'model_path': os.path.join(os.path.dirname(__file__), 'model_biner', 'bilstm_binary_best.h5'),
+        'tokenizer_path': os.path.join(os.path.dirname(__file__), 'model_biner', 'tokenizer.pkl')
+    }
+}
+# Dataset label order (index -> label):
+# 0: Tidak Stres
+# 1: Ringan
+# 2: Sedang
+# 3: Berat
+# 4: Sangat Berat
+MULTICLASS_LABELS = ['Tidak Stres', 'Ringan', 'Sedang', 'Berat', 'Sangat Berat']
+models = {}
+tokenizers = {}
+model_types = {}
 
-# Load model dengan error handling
-try:
-    print(f"Loading model from: {MODEL_PATH}")
-    print(f"Loading tokenizer from: {TOKENIZER_PATH}")
-    model = load_model(MODEL_PATH)
-    print("Model loaded successfully!")
-    with open(TOKENIZER_PATH, 'rb') as f:
-        tokenizer = pickle.load(f)
-    print("Tokenizer loaded successfully!")
-except Exception as e:
-    print(f"Error loading model/tokenizer: {str(e)}")
-    raise
 
+def detect_model_type(loaded_model, expected_type=None):
+    output_shape = getattr(loaded_model, 'output_shape', None)
+    if isinstance(output_shape, tuple) and len(output_shape) >= 2:
+        last_dim = output_shape[-1]
+        if last_dim == 1:
+            return 'binary'
+        if last_dim > 1:
+            return 'multiclass'
+    if expected_type:
+        return expected_type
+    return 'binary'
+
+for model_name, config in MODEL_CONFIG.items():
+    try:
+        print(f"Loading model '{model_name}' from: {config['model_path']}")
+        loaded_model = load_model(config['model_path'])
+        with open(config['tokenizer_path'], 'rb') as f:
+            loaded_tokenizer = pickle.load(f)
+        models[model_name] = loaded_model
+        tokenizers[model_name] = loaded_tokenizer
+        detected_type = detect_model_type(loaded_model, config['type'])
+        model_types[model_name] = detected_type
+        if detected_type != config['type']:
+            print(f"Warning: Model '{model_name}' was configured as '{config['type']}' but detected as '{detected_type}'.")
+        print(f"Model '{model_name}' loaded successfully! (detected type: {detected_type})")
+    except Exception as e:
+        print(f"Warning: Failed to load model '{model_name}' or tokenizer: {str(e)}")
+
+if not models:
+    raise RuntimeError('No machine learning models could be loaded. Check model files and tokenizer files.')
+
+DEFAULT_MODEL = 'binary' if 'binary' in models else next(iter(models))
 max_len = 100  # sesuai saat training
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'stresslog.db')
@@ -63,21 +103,91 @@ def predict():
         if not text:
             return jsonify({"error": "Text input is required"}), 400
 
+        selected_model = data.get('model', DEFAULT_MODEL)
+        if selected_model != 'both' and selected_model not in models:
+            return jsonify({
+                "error": f"Model '{selected_model}' is not available. Available models: {', '.join(models.keys())}, both"
+            }), 400
+
         print(f"Processing text: {text[:50]}...")
         cleaned_text = preprocess(text)
         print(f"Cleaned text: {cleaned_text[:50]}...")
-        
-        sequence = tokenizer.texts_to_sequences([cleaned_text])
-        print(f"Sequence: {sequence}")
-        padded = pad_sequences(sequence, maxlen=max_len)
-        print(f"Padded shape: {padded.shape}")
 
-        print("Running prediction...")
-        prob = float(model.predict(padded, verbose=0)[0][0])
-        print(f"Prediction probability: {prob}")
-        
-        prediction = "Negative" if prob < 0.5 else "Positive"
-        stress_percent = float(round((1 - prob) * 100, 2))
+        def run_model_prediction(model_name):
+            tokenizer = tokenizers[model_name]
+            sequence = tokenizer.texts_to_sequences([cleaned_text])
+            print(f"[{model_name}] Sequence: {sequence}")
+            padded = pad_sequences(sequence, maxlen=max_len)
+            print(f"[{model_name}] Padded shape: {padded.shape}")
+
+            raw = models[model_name].predict(padded, verbose=0)
+            output = np.asarray(raw).squeeze(axis=0)  # Only remove batch dimension, not time dimension
+            model_type = model_types[model_name]
+            print(f"[{model_name}] Raw output shape: {output.shape if hasattr(output, 'shape') else 'scalar'}")
+            print(f"[{model_name}] Model type: {model_type}, Output ndim: {output.ndim if hasattr(output, 'ndim') else 0}")
+
+            # PRIORITAS 1: Check model_type dulu (bukan dimensi)
+            if model_type == 'multiclass':
+                # Multiclass: Output harus array 5 class probabilities
+                probs = np.atleast_1d(np.asarray(output))  # Ensure at least 1D
+                if probs.ndim > 1:
+                    probs = probs.flatten()
+                
+                # Validate size matches multiclass labels
+                if probs.size != len(MULTICLASS_LABELS):
+                    print(f"[{model_name}] WARNING: Output size {probs.size} != expected {len(MULTICLASS_LABELS)}")
+                    print(f"[{model_name}] Output: {probs}")
+                
+                class_index = int(np.argmax(probs))
+                class_prob = float(probs[class_index])
+                stress_percent = float(round(class_prob * 100, 2))
+                class_label = MULTICLASS_LABELS[class_index] if class_index < len(MULTICLASS_LABELS) else f"Class_{class_index}"
+                print(f"[{model_name}] Multiclass prediction: {class_label} (index={class_index}, prob={class_prob:.4f})")
+                return {
+                    "model": model_name,
+                    "model_type": model_type,
+                    "prediction": class_label,
+                    "class_index": class_index,
+                    "class_label": class_label,
+                    "class_probability": class_prob,
+                    "stress_percent": stress_percent,
+                    "raw_output": probs.tolist()
+                }
+            else:
+                # PRIORITAS 2: Binary model
+                prob = float(output.item() if hasattr(output, 'item') else output)
+                # Existing `prediction` kept as Negative/Positive for frontend compatibility
+                prediction = "Negative" if prob < 0.5 else "Positive"
+                # Map to dataset labels: 0 => Stres, 1 => Tidak Stres
+                class_index = 0 if prob < 0.5 else 1
+                class_label = 'Stres' if class_index == 0 else 'Tidak Stres'
+                stress_percent = float(round((1 - prob) * 100, 2))
+                print(f"[{model_name}] Binary prediction: {prediction} (prob={prob:.4f}, class_index={class_index})")
+                return {
+                    "model": model_name,
+                    "model_type": model_type,
+                    "prediction": prediction,
+                    "probability": prob,
+                    "class_index": class_index,
+                    "class_label": class_label,
+                    "stress_percent": stress_percent,
+                    "raw_output": output.tolist() if hasattr(output, 'tolist') else float(output)
+                }
+
+        results = []
+        if selected_model == 'both':
+            for model_name in models:
+                results.append(run_model_prediction(model_name))
+            avg_prob = sum(r['probability'] for r in results if 'probability' in r) / len(results)
+            prediction = "Negative" if avg_prob < 0.5 else "Positive"
+            stress_percent = float(round((1 - avg_prob) * 100, 2))
+            actual_model_type = results[0]['model_type'] if results else selected_model
+        else:
+            single_result = run_model_prediction(selected_model)
+            results.append(single_result)
+            prediction = single_result['prediction']
+            stress_percent = single_result['stress_percent']
+            actual_model_type = single_result['model_type']
 
         # Simpan ke database
         try:
@@ -92,7 +202,10 @@ def predict():
 
         return jsonify({
             "prediction": prediction,
-            "stress_percent": stress_percent
+            "stress_percent": stress_percent,
+            "model_type": actual_model_type,
+            "models_used": [r['model'] for r in results],
+            "details": results
         })
 
     except Exception as e:
@@ -145,8 +258,8 @@ def add_cors_headers(response):
     return response
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Gunakan PORT dari Railway
+    port = int(os.environ.get("PORT", 5000))  
     print(f"Starting Flask server on port {port}...")
-    print(f"Model path: {MODEL_PATH}")
-    print(f"Tokenizer path: {TOKENIZER_PATH}")
-    app.run(debug=True, host="0.0.0.0", port=port)  # Set debug=True untuk melihat error detail
+    print(f"Loaded models: {', '.join(models.keys())}")
+    app.run(debug=True, host="0.0.0.0", port=port)  
+    
